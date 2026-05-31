@@ -61,7 +61,8 @@ ignored/
 .worktrees/
 environments/benchmarks/evals/
 
-# Web UI build output
+# Build artifacts
+/build/
 hermes_cli/web_dist/
 apps/desktop/build/
 apps/desktop/dist/
