@@ -1252,7 +1252,40 @@ function resolveHermesBackend(dashboardArgs) {
     if (backend) return backend
   }
 
-  // 3. Bootstrap-complete ACTIVE_HERMES_ROOT -- the canonical install at
+  // 3. Bundled Python -- embedded Python runtime shipped inside the packaged
+  //    app at resources/python/, resources/hermes/, resources/site-packages/.
+  //    Only active when IS_PACKAGED (app.asar exists); in dev mode the
+  //    source checkout at step 2 picks up the live Python code instead.
+  //    This MUST come before steps 4-7 (bootstrap, PATH hermes, system
+  //    Python) so a packaged app always uses its bundled runtime rather
+  //    than a potentially-stale system install.
+  if (IS_PACKAGED) {
+    const bundledPython = path.join(process.resourcesPath, 'resources', 'python', 'python.exe')
+    const bundledHermes = path.join(process.resourcesPath, 'resources', 'hermes')
+    const bundledSitePackages = path.join(process.resourcesPath, 'resources', 'site-packages')
+
+    if (fileExists(bundledPython) && directoryExists(bundledHermes)) {
+      return {
+        kind: 'bundled',
+        command: bundledPython,
+        args: ['-m', 'hermes_cli.main', ...dashboardArgs],
+        env: {
+          PYTHONHOME: path.join(process.resourcesPath, 'resources', 'python'),
+          PYTHONPATH: [bundledHermes, bundledSitePackages, process.env.PYTHONPATH]
+            .filter(Boolean).join(path.delimiter),
+          HERMES_HOME,
+          HERMES_BUNDLED: '1',
+          HERMES_RESOURCES: path.join(process.resourcesPath, 'resources')
+        },
+        shell: false,
+        label: 'Bundled Python (embedded)',
+        root: bundledHermes,
+        bootstrap: false
+      }
+    }
+  }
+
+  // 4. Bootstrap-complete ACTIVE_HERMES_ROOT -- the canonical install at
   //    %LOCALAPPDATA%\hermes\hermes-agent (Windows) or ~/.hermes/hermes-agent.
   //    The bootstrap marker means install.ps1 stages finished and the user
   //    completed initial configuration; we trust the install and go straight
@@ -1262,7 +1295,7 @@ function resolveHermesBackend(dashboardArgs) {
     return createActiveBackend(dashboardArgs)
   }
 
-  // 4. Existing `hermes` on PATH -- installed via install.ps1 / install.sh from
+  // 5. Existing `hermes` on PATH -- installed via install.ps1 / install.sh from
   //    a previous tool-only setup, or pip-installed system-wide. Use it but
   //    do NOT write a bootstrap marker; the user did this themselves and we
   //    don't want to take ownership of an install we didn't perform.
@@ -1317,18 +1350,18 @@ function resolveHermesBackend(dashboardArgs) {
     }
   }
 
-  // 5. Last-ditch: pip-installed hermes_cli module via system Python.
-  //    Same rationale as #4 -- the user installed this; we use it but don't
+  // 6. Last-ditch: pip-installed hermes_cli module via system Python.
+  //    Same rationale as #5 -- the user installed this; we use it but don't
   //    take ownership.
   const python = findSystemPython()
   if (python) {
-    // Same smoke-test rationale as step 4: a system Python in the
+    // Same smoke-test rationale as step 5: a system Python in the
     // SUPPORTED_VERSIONS range can be registered (PEP 514) without
     // having hermes_cli installed -- common on dev boxes that have
     // a python.org install from prior unrelated work. Returning that
     // backend hands the spawn step a guaranteed ModuleNotFoundError.
     // Verify the import works before trusting the candidate; on
-    // failure, fall through to step 6 so the bootstrap runner pulls
+    // failure, fall through to step 7 so the bootstrap runner pulls
     // a uv-managed 3.11 into %LOCALAPPDATA%\hermes\hermes-agent\venv.
     if (canImportHermesCli(python)) {
       return {
@@ -1346,7 +1379,7 @@ function resolveHermesBackend(dashboardArgs) {
     )
   }
 
-  // 6. Nothing usable yet -- signal the bootstrap runner that we need to
+  // 7. Nothing usable yet -- signal the bootstrap runner that we need to
   //    clone+install. Phase 1D's bootstrap-runner consumes this sentinel
   //    and drives install.ps1 stages with a progress UI. Until 1D lands,
   //    callers see the sentinel and surface it as a user-facing error
@@ -1372,7 +1405,40 @@ function resolveHermesBackend(dashboardArgs) {
   }
 }
 
+async function ensureBundledEnvironment() {
+  const dirs = ['cron', 'sessions', 'logs', 'pairing', 'hooks', 'image_cache', 'audio_cache', 'memories', 'skills']
+  for (const dir of dirs) {
+    fs.mkdirSync(path.join(HERMES_HOME, dir), { recursive: true })
+  }
+
+  const envPath = path.join(HERMES_HOME, '.env')
+  if (!fileExists(envPath)) {
+    const bundledEnv = path.join(process.resourcesPath, 'resources', 'hermes', '.env.example')
+    const content = fileExists(bundledEnv)
+      ? fs.readFileSync(bundledEnv, 'utf8')
+      : '# Hermes Desktop — bundled install\n# Add your API keys below\n'
+    fs.writeFileSync(envPath, content, 'utf8')
+    rememberLog(`[bundled] Created default .env at ${envPath}`)
+  }
+
+  const configPath = path.join(HERMES_HOME, 'config.yaml')
+  if (!fileExists(configPath)) {
+    const bundledConfig = path.join(process.resourcesPath, 'resources', 'hermes', 'hermes_cli', 'config.py')
+    if (fileExists(bundledConfig)) {
+      rememberLog('[bundled] config.yaml will be created by Python backend on first start')
+    }
+  }
+
+  if (IS_WINDOWS && !findGitBash()) {
+    rememberLog('[bundled] Git Bash not found; terminal tool may be unavailable')
+  }
+}
+
 async function ensureRuntime(backend) {
+  if (backend.kind === 'bundled') {
+    await ensureBundledEnvironment()
+  }
+
   if (!backend.bootstrap) {
     await advanceBootProgress('runtime.external', `Using ${backend.label}`, 32)
     return backend
