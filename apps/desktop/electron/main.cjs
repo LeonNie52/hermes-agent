@@ -1275,7 +1275,8 @@ function resolveHermesBackend(dashboardArgs) {
             .filter(Boolean).join(path.delimiter),
           HERMES_HOME,
           HERMES_BUNDLED: '1',
-          HERMES_RESOURCES: path.join(process.resourcesPath, 'resources')
+          HERMES_RESOURCES: path.join(process.resourcesPath, 'resources'),
+          HERMES_GIT_BASH_PATH: path.join(process.resourcesPath, 'resources', 'git', 'bin', 'bash.exe')
         },
         shell: false,
         label: 'Bundled Python (embedded)',
@@ -1429,8 +1430,11 @@ async function ensureBundledEnvironment() {
     }
   }
 
-  if (IS_WINDOWS && !findGitBash()) {
-    rememberLog('[bundled] Git Bash not found; terminal tool may be unavailable')
+  if (IS_WINDOWS) {
+    const bundledBash = path.join(process.resourcesPath, 'resources', 'git', 'bin', 'bash.exe')
+    if (fileExists(bundledBash)) {
+      rememberLog(`[bundled] Git Bash bundled at ${bundledBash}`)
+    }
   }
 }
 

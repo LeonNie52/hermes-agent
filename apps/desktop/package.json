@@ -23,7 +23,7 @@
     "dist:mac:dmg": "npm run build && npm run builder -- --mac dmg",
     "dist:mac:zip": "npm run build && npm run builder -- --mac zip",
     "dist:win": "npm run build && npm run builder -- --win",
-    "dist:win:bundled": "node scripts/bundle-python.cjs && node scripts/bundle-hermes.cjs && npm run build && npm run builder -- --win",
+    "dist:win:bundled": "node scripts/bundle-git.cjs && node scripts/bundle-python.cjs && node scripts/bundle-hermes.cjs && npm run build && npm run builder -- --win",
     "dist:win:msi": "npm run build && npm run builder -- --win msi",
     "dist:win:nsis": "npm run build && npm run builder -- --win nsis",
     "test:desktop": "node scripts/test-desktop.mjs",
