@@ -950,3 +950,114 @@ npm run dist:win:bundled
 ```
 
 这样只在依赖文件变化时重新下载 Python 和安装包。
+
+---
+
+## 系统依赖补齐计划
+
+### 背景
+
+当前 bundled 方案仅覆盖 `install.ps1` 的 **Python 层**（Python 运行时 + hermes 源码 + pip 依赖），而 `install.ps1` 实际安装的组件远不止这些。以下组件全部缺失，导致对应的核心功能不可用。
+
+### 与 install.ps1 的完整功能对标
+
+| install.ps1 Stage | 安装内容 | 体积 | Bundled 现状 | 缺失影响 |
+|-------------------|----------|------|-------------|----------|
+| `uv` | uv 包管理器 | ~10 MB | **无需处理** | 构建时用 pip，运行时不需要 uv |
+| `python` | Python 3.11 | ~25 MB | **已覆盖** | 嵌入式 Python 3.11.9 在 `resources/python/` |
+| `git` | PortableGit 2.54 + bash.exe | ~57 MB | **缺失** | `terminal` 工具完全不可用，agent 无法执行任何命令 |
+| `node` | Node.js 22 LTS 便携版 | ~30 MB | **缺失** | browser 工具不可用 |
+| `system-packages` | ripgrep + ffmpeg | ~50 MB | **缺失** | 文件搜索降级为 Python 遍历；TTS 语音消息不可用 |
+| `repository` | git clone hermes-agent | ~36 MB | **已覆盖** | 源码快照在 `resources/hermes/` |
+| `venv` | Python 虚拟环境 | — | **无需处理** | 嵌入式 Python 直连 site-packages |
+| `dependencies` | pip install hermes-agent[all] | ~295 MB | **已覆盖** | 在 `resources/site-packages/` |
+| `node-deps` | npm install + Playwright Chromium | ~170 MB | **缺失** | 浏览器自动化不可用 |
+| `desktop` | 构建 Hermes.exe | — | **已覆盖** | 当前产物即为打包结果 |
+| `path` | 添加到 PATH | — | **无需处理** | bundled 应用不需要全局 CLI |
+| `config-templates` | .env / config.yaml / skills 同步 | ~36 MB | **部分覆盖** | 仅有目录 + .env 模板，无 skills 同步 |
+| `platform-sdks` | 按 token 安装 messaging SDK | 按需 | **缺失** | 绑定 messaging 的用户缺少对应 SDK |
+| `bootstrap-marker` | 写入安装完成标记 | — | **无需处理** | bundled 路径不经过 bootstrap 流程 |
+
+### 补齐计划（按优先级）
+
+#### P0 — Git for Windows / bash.exe（必须）
+
+- **原因**：`terminal` 工具是 Hermes 最基础能力，Windows 上依赖 `bash.exe`。缺少则 agent 无法执行任何 shell 命令
+- **体积**：~57 MB（PortableGit 2.54.0）
+- **方案**：构建时下载 PortableGit 嵌入 `resources/git/`
+  - 下载 URL：`https://github.com/git-for-windows/git/releases/download/v2.54.0.windows.1/PortableGit-2.54.0-64-bit.7z.exe`
+  - 自解压到 `resources/git/`（7z.exe 格式，`-o<dest> -y` 即可解压）
+  - 修改 `main.cjs` bundled backend env：添加 `HERMES_GIT_BASH_PATH` 指向 `resources/git/bin/bash.exe`
+  - `tools/environments/local.py` 中的 `find_git_bash()` 通过 `HERMES_GIT_BASH_PATH` 定位 bash.exe
+- **实现文件**：`bundle-git.cjs`（新增）+ `main.cjs` env 修改
+- **安装包增量**：+57 MB → 总计 ~266 MB
+
+#### P1 — Skills 首次同步
+
+- **原因**：首次运行体验需要本地有 skills，离线时应可用
+- **体积**：~36 MB（`skills/` + `optional-skills/` 已在 `resources/hermes/` 中，仅需复制）
+- **方案**：在 `ensureBundledEnvironment()` 中调用 Python 脚本同步 skills
+  - `python -c "from tools.skills_sync import sync_skills; sync_skills('resources/hermes/skills', 'HERMES_HOME/skills')"`
+  - 或简化为首次运行时复制 `resources/hermes/skills/` → `HERMES_HOME/skills/`
+  - 避免覆盖用户已有 skills（仅同步 bundled 中有、用户侧没有的）
+- **实现文件**：`main.cjs` `ensureBundledEnvironment()` 修改
+- **安装包增量**：0（skills 已在源码树中）
+
+#### P2 — Node.js 运行时（按需安装）
+
+- **原因**：browser 工具需要 Node.js + npm，但并非所有用户都使用浏览器功能
+- **体积**：~30 MB（Node.js 22 LTS 便携 zip）
+- **方案**：延迟安装——首次调用 browser 工具时后台安装到 `HERMES_HOME/node/`
+  - 下载 `https://nodejs.org/dist/latest-v22.x/node-v22.X.Y-win-x64.zip`
+  - 解压到 `%LOCALAPPDATA%\hermes\node\`
+  - 设置 `HERMES_NODE_PATH` 环境变量
+  - agent-browser 读取此变量定位 Node.js
+- **实现文件**：`main.cjs`（新增 `ensureNodeJs()` + IPC handler）
+- **安装包增量**：0（不嵌入安装包）
+
+#### P3 — ripgrep
+
+- **原因**：提升文件搜索体验（`search_files` 工具），缺失时可降级为 Python 遍历
+- **体积**：~5 MB（ripgrep 单文件 `rg.exe`）
+- **方案 A（推荐）**：嵌入 `resources/rg.exe`（体积小）
+- **方案 B**：首次运行时 winget 安装 `BurntSushi.ripgrep.MSVC`
+- **实现文件**：`bundle-python.cjs`（下载 rg.exe）+ `main.cjs` env
+- **安装包增量**：+5 MB
+
+#### P3 — ffmpeg
+
+- **原因**：TTS 语音消息需要 ffmpeg 进行音频处理
+- **体积**：~50 MB
+- **方案**：首次使用时按需安装，不嵌入安装包
+  - `winget install Gyan.FFmpeg` 或下载 portable 版到 `HERMES_HOME/ffmpeg/`
+- **安装包增量**：0
+
+#### P4 — Playwright Chromium
+
+- **原因**：浏览器自动化需要专用 Chromium
+- **体积**：~170 MB（压缩后也很大）
+- **方案**：首次调用 browser 工具时通过 `npx playwright install chromium` 安装
+  - 默认安装到 `%LOCALAPPDATA%\ms-playwright\`
+  - 属于 browser 工具初始化流程，不阻塞启动
+- **安装包增量**：0
+
+### 补齐后安装包预估
+
+| 阶段 | 组件 | 安装包增量 |
+|------|------|-----------|
+| 当前 | Python + 源码 + 依赖 | 209 MB |
+| P0 | + PortableGit | +57 MB → 266 MB |
+| P1 | + Skills 同步 | 0 |
+| P3 | + ripgrep | +5 MB → 271 MB |
+| **合计** | — | **~271 MB** |
+
+其余组件（Node.js、ffmpeg、Playwright）均采用延迟/按需安装，不增大安装包。
+
+### 影响范围
+
+| 文件 | 改动 |
+|------|------|
+| `apps/desktop/scripts/bundle-git.cjs` | **新增** — 下载 PortableGit 解压到 `resources/git/` |
+| `apps/desktop/scripts/bundle-python.cjs` | 修改 — 新增下载 rg.exe 到 `resources/` |
+| `apps/desktop/electron/main.cjs` | 修改 — env 新增 `HERMES_GIT_BASH_PATH` + `ensureBundledEnvironment` 补充 skills 同步 |
+| `apps/desktop/package.json` | 修改 — dist:win:bundled 脚本加入 bundle-git.cjs |
