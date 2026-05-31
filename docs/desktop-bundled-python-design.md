@@ -773,14 +773,96 @@ async function startBundledBackend(dashboardArgs) {
 }
 ```
 
+## 实现中的关键问题与解决方案
+
+### 问题 1：嵌入式 Python 的 `_pth` 文件覆盖 PYTHONPATH
+
+**现象**：设置 `PYTHONPATH` 环境变量后，`sys.path` 中不包含 `PYTHONPATH` 中的目录，导致 `import hermes_cli` 失败。
+
+**根因**：嵌入式 Python 在存在 `python3xx._pth` 文件时，**完全忽略 `PYTHONPATH` 环境变量**。`sys.path` 仅由 `_pth` 文件中列出的路径决定。
+
+**解决**：将源码路径 `..\hermes` 写入 `_pth` 文件，置于 `..\site-packages` 之前：
+
+```
+python311.zip
+.
+
+import site          ← 取消注释，启用 site-packages 中的 .pth 文件处理
+
+..\hermes            ← ★ 新增：hermes-agent 源码（优先）
+..\site-packages     ← 第三方依赖
+```
+
+这样 `sys.path` 的顺序为源码优先，确保完整的 `hermes_cli` 包（含 `dashboard_auth`、`proxy` 等子包）不被 `site-packages` 中的残缺版覆盖。
+
+### 问题 2：pip install --target 的源码重复
+
+**现象**：`pip install hermes-agent[all] --target site-packages/` 不仅安装第三方依赖，也会把 `hermes-agent` 自身的源码（`hermes_cli/`、`agent/`、`tools/` 等）安装到 `site-packages/`。
+
+由于 `pyproject.toml` 中 `setuptools.packages.find.include` 缺少 `"hermes_cli.*"` 通配符（只有 `"hermes_cli"`），pip 安装的 `hermes_cli` 缺少 `dashboard_auth` 和 `proxy` 子包。运行时 Python 可能先找到这个残缺版而非 `resources/hermes/` 中的完整源码树。
+
+**解决**：`bundle-python.cjs` 中新增 `cleanupSourceDuplicates()` 函数，安装后删除 `site-packages/` 中所有 hermes-agent 源码：
+
+- 删除的 py-modules：`run_agent.py`、`model_tools.py`、`toolsets.py`、`cli.py`、`hermes_constants.py` 等 13 个
+- 删除的 packages：`agent/`、`tools/`、`hermes_cli/`、`gateway/`、`plugins/`、`providers/` 等 9 个
+- 删除的 dist-info：`hermes_agent-*.dist-info`
+
+### 问题 3：ensurepip 不可用
+
+**现象**：`python.exe -m ensurepip --default-pip` 报错 `No module named ensurepip`。
+
+**根因**：Windows 嵌入式 Python 不包含 `ensurepip` 模块（CPython 在 embeddable 发行版中去掉了它）。
+
+**解决**：改用 `curl` 下载 `https://bootstrap.pypa.io/get-pip.py`，然后用嵌入式 Python 运行它来引导 pip。
+
+### 问题 4：构建幂等性
+
+**场景**：重复运行 `npm run dist:win:bundled` 时，`bundle-python.cjs` 检测到 `python.exe` 已存在就跳过，但首次构建后 `site-packages/` 中可能残留源码重复文件（如果是从旧版本迁移）。
+
+**解决**：`main()` 函数会额外检查是否存在需要清理的重复文件（`site-packages/hermes_cli`、`site-packages/agent` 等），若存在则运行 `cleanupSourceDuplicates()`。
+
+---
+
+## 构建产物实测数据
+
+| 组件 | 文件数 | 解压大小 | 备注 |
+|------|--------|----------|------|
+| `resources/python/` | ~35 | 39.8 MB | Python 3.11.9 embeddable + DLLs |
+| `resources/hermes/` | 1,956 | 36.4 MB | hermes-agent 完整源码（排除 tests/docs） |
+| `resources/site-packages/` | ~100 包 | 295.5 MB | hermes-agent[all] 依赖 |
+| **resources/ 合计** | — | **371.7 MB** | — |
+| `release/win-unpacked/` | — | 744.6 MB | 含 app.asar + resources/ + Electron 运行时 |
+| **NSIS 安装包** | 1 | **208.7 MB** | 压缩后（约 28% 压缩率） |
+| **MSI 安装包** | 1 | **207.2 MB** | Windows Installer 格式 |
+
+---
+
+## 启动路径对比
+
+| 步骤 | `dist:win` (普通) | `dist:win:bundled` (嵌入式) |
+|------|-------------------|---------------------------|
+| Step 1 | HERMES_DESKTOP_HERMES_ROOT 覆盖 | ← 相同 |
+| Step 2 | 开发源码检测 | ← 相同 |
+| Step 3 | **Bootstrap-complete 已安装** | **★ Bundled Python ★** |
+| Step 4 | PATH 上的 hermes CLI | Bootstrap-complete（后备） |
+| Step 5 | 系统 Python + hermes_cli | PATH 上的 hermes CLI |
+| Step 6 | bootstrap-needed → 下载安装 | 系统 Python |
+| Step 7 | — | bootstrap-needed（兜底） |
+
+Bundled 模式下 Step 3 直接命中，跳过所有 bootstrap 逻辑（`bootstrap: false`），**首次启动耗时 < 5 秒**。
+
+---
+
 ## 关键注意事项
 
 | 问题 | 解决方案 |
 |------|----------|
-| Embedded Python 默认禁用 site-packages | 修改 `python3xx._pth`：取消注释 `import site` + 添加 `..\site-packages` 行 |
-| 嵌入式 Python 不含 pip | 构建时运行 `python -m ensurepip --default-pip` |
+| Embedded Python 默认禁用 site-packages | 修改 `python3xx._pth`：取消注释 `import site` + 添加 `..\hermes`、`..\site-packages` 行 |
+| **PYTHONPATH 被 _pth 覆盖** | **将 `..\hermes` 写入 `_pth`，置于 `..\site-packages` 之前，确保源码优先** |
+| **pip install --target 产生源码重复** | **安装后删除 `site-packages/` 中 hermes-agent 源码文件（`cleanupSourceDuplicates()`）** |
+| 嵌入式 Python 不含 pip | 构建时通过 `get-pip.py` 引导（`ensurepip` 在 embeddable 中不可用） |
 | 依赖安装耗时 | CI 中缓存 `resources/` 目录，按 `pyproject.toml` hash 更新 |
-| 磁盘空间（Python + 依赖 ~200MB） | Windows installer 可以接受，NSIS 可压缩到 ~80MB |
+| 磁盘空间（Python + 依赖 ~372MB） | NSIS 压缩至 ~209MB；如需减小可从 `[all]` 中去掉 dev/google 等 heavy extras |
 | 路径中有空格 | spawn 时用 `shell: false`，args 数组自动处理引号 |
 | hermes update 行为 | bundled 模式通过 electron-updater 更新整个 app，不走 `hermes update` |
 | terminal 工具需要 bash.exe | 首次运行时安装 PortableGit 到 `HERMES_HOME/git/`（策略 A），或检查系统 Git |
@@ -798,11 +880,59 @@ async function startBundledBackend(dashboardArgs) {
 
 | 文件 | 操作 | 改动量 | 说明 |
 |------|------|--------|------|
-| `apps/desktop/scripts/bundle-python.cjs` | 新增 | ~220 行 | 下载 Python + pip install[all] + 基准导入验证 |
-| `apps/desktop/scripts/bundle-hermes.cjs` | 新增 | ~100 行 | submodule checkout + 源码复制 |
-| `apps/desktop/electron/main.cjs` | 修改 | ~120 行 | bundled backend 解析 + 首次运行初始化（Git/bash.exe、skills sync、目录结构） |
-| `apps/desktop/package.json` | 修改 | +5 行 | dist:win 脚本 + extraResources |
-| `pyproject.toml` | 确认 | — | 确认 `[all]` extra 完整 |
+| `apps/desktop/scripts/bundle-python.cjs` | 新增 | ~230 行 | 下载 Python + get-pip.py + pip install[all] + 源码重复清理 + 基准导入验证 |
+| `apps/desktop/scripts/bundle-hermes.cjs` | 新增 | ~80 行 | submodule checkout + 源码复制（排除 tests/docs/build 等） |
+| `apps/desktop/electron/main.cjs` | 修改 | ~120 行 | bundled backend 解析（Step 3）+ ensureBundledEnvironment 首次初始化 |
+| `apps/desktop/package.json` | 修改 | +8 行 | dist:win:bundled 脚本 + resources/ extraResources |
+| `apps/desktop/scripts/before-build.cjs` | 修改 | 注释更新 | 补充 bundled 分发路径说明 |
+| `.gitignore` | 修改 | +2 行 | 排除 `apps/desktop/resources/` + 根目录 `/build/` |
+
+---
+
+## 完整构建命令
+
+```bash
+# 开发模式（无需 Python，使用 checkout 源码 + 系统 Python）
+npm run dev
+
+# 标准分发（不含嵌入式 Python，首次启动时下载安装）
+npm run dist:win
+
+# 独立分发（嵌入式 Python，开箱即用）
+npm run dist:win:bundled
+```
+
+---
+
+## 首次启动完整流程
+
+```
+用户双击 Hermes.exe
+  │
+  ├─ Electron 启动 (IS_PACKAGED = true)
+  │
+  ├─ resolveHermesBackend()
+  │     Step 3: IS_PACKAGED && resources/python/python.exe 存在
+  │     → { kind: 'bundled', bootstrap: false, root: resources/hermes, ... }
+  │
+  ├─ ensureRuntime(backend)
+  │     ├─ backend.kind === 'bundled' → ensureBundledEnvironment()
+  │     │     ├─ 创建 ~/.hermes/{cron,sessions,logs,skills,...}
+  │     │     ├─ 复制 .env.example → ~/.hermes/.env (如不存在)
+  │     │     └─ 检测 Git Bash (terminal 工具依赖)
+  │     └─ bootstrap: false → 直接返回，跳过下载/安装
+  │
+  └─ spawn: resources/python/python.exe -m hermes_cli.main dashboard ...
+        env:
+          PYTHONHOME = resources/python/
+          HERMES_HOME = %LOCALAPPDATA%\hermes
+          HERMES_BUNDLED = 1
+        sys.path (来自 python311._pth):
+          1. python311.zip
+          2. .                    (python.exe 目录)
+          3. ..\hermes            ★ 源码优先
+          4. ..\site-packages     第三方依赖
+```
 
 ---
 
