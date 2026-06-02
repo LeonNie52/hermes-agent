@@ -898,8 +898,11 @@ npm run dev
 # 标准分发（不含嵌入式 Python，首次启动时下载安装）
 npm run dist:win
 
-# 独立分发（嵌入式 Python，开箱即用）
-npm run dist:win:bundled
+# 独立分发 x64（嵌入式 Python，开箱即用）
+npm run dist:win:bundled:x64
+
+# 独立分发 ARM64（嵌入式 Python，开箱即用）
+npm run dist:win:bundled:arm64
 ```
 
 ---
@@ -1061,3 +1064,105 @@ npm run dist:win:bundled
 | `apps/desktop/scripts/bundle-python.cjs` | 修改 — 新增下载 rg.exe 到 `resources/` |
 | `apps/desktop/electron/main.cjs` | 修改 — env 新增 `HERMES_GIT_BASH_PATH` + `ensureBundledEnvironment` 补充 skills 同步 |
 | `apps/desktop/package.json` | 修改 — dist:win:bundled 脚本加入 bundle-git.cjs |
+
+---
+
+## Windows ARM64 支持（计划）
+
+### 背景
+
+当前 bundled 方案仅支持 Windows x86_64 (amd64)。随着 ARM64 Windows 设备（Surface Pro X、Qualcomm Snapdragon PC 等）逐渐普及，需要扩展支持。
+
+### 可行性分析
+
+| 组件 | x64 状态 | ARM64 状态 | 备注 |
+|------|----------|------------|------|
+| Python embeddable | ✅ `python-3.11.9-embed-amd64.zip` | ✅ `python-3.11.9-embed-arm64.zip` | python.org 已提供 |
+| PortableGit | ✅ `PortableGit-2.54.0-64-bit.7z.exe` | ✅ `PortableGit-2.54.0-arm64.7z.exe` | Git for Windows v2.54.0 已支持 |
+| electron-builder | ✅ 支持 | ✅ 支持 | 通过 `npm_config_arch` 机制 |
+| node-pty | ✅ `win32-x64/*.node` | ✅ `win32-arm64/*.node` | v1.1.0 支持 |
+
+### 需要修改的文件
+
+| 文件 | 操作 | 改动说明 |
+|------|------|----------|
+| `apps/desktop/scripts/bundle-python.cjs` | 修改 | 新增 `TARGET_ARCH` 检测，根据 `npm_config_arch` 选择 amd64/arm64 Python URL |
+| `apps/desktop/scripts/bundle-git.cjs` | 修改 | 根据 `TARGET_ARCH` 选择 amd64/arm64 PortableGit URL |
+| `apps/desktop/package.json` | 修改 | win target 新增 `arch: ["x64", "arm64"]` |
+
+### 实现步骤
+
+#### Step 1：修改 `bundle-python.cjs`
+
+```javascript
+const TARGET_ARCH = process.env.npm_config_arch || process.arch  // 'x64' | 'arm64'
+
+const PYTHON_URLS = {
+  x64: `https://www.python.org/ftp/python/${PYTHON_VERSION}/python-${PYTHON_VERSION}-embed-amd64.zip`,
+  arm64: `https://www.python.org/ftp/python/${PYTHON_VERSION}/python-${PYTHON_VERSION}-embed-arm64.zip`,
+}
+const PYTHON_URL = PYTHON_URLS[TARGET_ARCH] || PYTHON_URLS.x64
+```
+
+#### Step 2：修改 `bundle-git.cjs`
+
+```javascript
+const TARGET_ARCH = process.env.npm_config_arch || process.arch
+
+const GIT_BUILDS = {
+  x64: { version: '2.54.0.windows.1', url: '...PortableGit-2.54.0-64-bit.7z.exe' },
+  arm64: { version: '2.54.0.windows.1', url: '...PortableGit-2.54.0-arm64.7z.exe' },
+}
+```
+
+#### Step 3：修改 `package.json`
+
+新增架构专属的 npm scripts，直接在脚本名称中区分架构：
+
+```json
+{
+  "scripts": {
+    "dist:win:bundled:x64": "cross-env npm_config_arch=x64 node scripts/bundle-git.cjs && node scripts/bundle-python.cjs && node scripts/bundle-hermes.cjs && npm run build && npm run builder -- --win --x64",
+    "dist:win:bundled:arm64": "cross-env npm_config_arch=arm64 node scripts/bundle-git.cjs && node scripts/bundle-python.cjs && node scripts/bundle-hermes.cjs && npm run build && npm run builder -- --win --arm64"
+  }
+}
+```
+
+同时更新 win target 配置以支持多架构：
+
+```json
+"win": {
+  "target": [
+    { "target": "nsis", "arch": ["x64", "arm64"] },
+    { "target": "msi", "arch": ["x64", "arm64"] }
+  ]
+}
+```
+
+### 构建命令
+
+```bash
+# x64 构建
+npm run dist:win:bundled:x64
+
+# ARM64 交叉编译
+npm run dist:win:bundled:arm64
+```
+
+### 关键注意事项
+
+| 问题 | 解决方案 |
+|------|----------|
+| Cross-compilation 环境 | 需要 Visual Studio 2017+ 带 ARM64 组件，或 `npm install` 时设置 `npm_config_arch=arm64` |
+| NSIS 多架构打包内存问题 | 多架构在同一 NSIS 安装包中可能导致 Internal compiler error；建议分开发布 |
+| CI 缓存 | CI 需分别缓存 `resources/` x64 和 arm64 目录 |
+| stage-native-deps.cjs | ✅ 已有 `npm_config_arch` 支持，无需修改 |
+
+### 构建产物预估
+
+| 架构 | NSIS 安装包 |
+|------|-------------|
+| x64 | ~271 MB |
+| arm64 | ~266 MB |
+
+ARM64 版本略小（ARM64 二进制比 x64 小约 5-10%）。
