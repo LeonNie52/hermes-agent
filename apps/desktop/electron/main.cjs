@@ -1260,7 +1260,8 @@ function resolveHermesBackend(dashboardArgs) {
   //    Python) so a packaged app always uses its bundled runtime rather
   //    than a potentially-stale system install.
   if (IS_PACKAGED) {
-    const bundledPython = path.join(process.resourcesPath, 'resources', 'python', 'python.exe')
+    const bundledPythonDir = path.join(process.resourcesPath, 'resources', 'python')
+    const bundledPython = path.join(bundledPythonDir, 'python.exe')
     const bundledHermes = path.join(process.resourcesPath, 'resources', 'hermes')
     const bundledSitePackages = path.join(process.resourcesPath, 'resources', 'site-packages')
 
@@ -1270,7 +1271,8 @@ function resolveHermesBackend(dashboardArgs) {
         command: bundledPython,
         args: ['-m', 'hermes_cli.main', ...dashboardArgs],
         env: {
-          PYTHONHOME: path.join(process.resourcesPath, 'resources', 'python'),
+          PATH: `${bundledPythonDir}${path.delimiter}${process.env.PATH || ''}`,
+          // PYTHONHOME: path.join(process.resourcesPath, 'resources', 'python'),
           PYTHONPATH: [bundledHermes, bundledSitePackages, process.env.PYTHONPATH]
             .filter(Boolean).join(path.delimiter),
           HERMES_HOME,
