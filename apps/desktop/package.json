@@ -26,6 +26,7 @@
     "dist:mac:dmg": "npm run build && npm run builder -- --mac dmg",
     "dist:mac:zip": "npm run build && npm run builder -- --mac zip",
     "dist:win": "npm run build && npm run builder -- --win",
+    "dist:win:bundled": "node scripts/bundle-git.cjs && node scripts/bundle-python.cjs && node scripts/bundle-hermes.cjs && npm run build && npm run builder -- --win",
     "dist:win:msi": "npm run build && npm run builder -- --win msi",
     "dist:win:nsis": "npm run build && npm run builder -- --win nsis",
     "dist:linux": "npm run build && npm run builder -- --linux AppImage deb rpm",
@@ -160,6 +161,22 @@
       {
         "from": "assets/icon.ico",
         "to": "icon.ico"
+      },
+      {
+        "from": "resources/python",
+        "to": "python"
+      },
+      {
+        "from": "resources/git",
+        "to": "git"
+      },
+      {
+        "from": "resources/hermes",
+        "to": "hermes"
+      },
+      {
+        "from": "resources/site-packages",
+        "to": "site-packages"
       }
     ],
     "asar": true,

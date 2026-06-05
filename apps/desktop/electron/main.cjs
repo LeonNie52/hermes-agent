@@ -1908,7 +1908,49 @@ function resolveHermesBackend(dashboardArgs) {
     if (backend) return backend
   }
 
-  // 3. Bootstrap-complete ACTIVE_HERMES_ROOT -- the canonical install at
+  // 3. Bundled Python -- embedded Python runtime shipped inside the packaged
+  //    app at resources/python/, resources/hermes/, resources/site-packages/.
+  //    Only active when IS_PACKAGED (app.asar exists); in dev mode the
+  //    source checkout at step 2 picks up the live Python code instead.
+  //    This MUST come before steps 4-7 (bootstrap, PATH hermes, system
+  //    Python) so a packaged app always uses its bundled runtime rather
+  //    than a potentially-stale system install.
+  //
+  // NOTE: process.resourcesPath IS the resources directory at runtime, so
+  // extras placed via electron-builder's `to: "<name>"` config land at
+  // process.resourcesPath/<name>/, NOT process.resourcesPath/resources/<name>/.
+  // The bootstrap-needed fallback below would otherwise fetch install.ps1
+  // from GitHub raw every launch -- a 30s stall on a clean box, plus a
+  // hard network requirement that contradicts the whole point of bundling.
+  if (IS_PACKAGED) {
+    const bundledPythonDir = path.join(process.resourcesPath, 'python')
+    const bundledPython = path.join(bundledPythonDir, 'python.exe')
+    const bundledHermes = path.join(process.resourcesPath, 'hermes')
+    const bundledSitePackages = path.join(process.resourcesPath, 'site-packages')
+
+    if (fileExists(bundledPython) && directoryExists(bundledHermes)) {
+      return {
+        kind: 'bundled',
+        command: bundledPython,
+        args: ['-m', 'hermes_cli.main', ...dashboardArgs],
+        env: {
+          PATH: `${bundledPythonDir}${path.delimiter}${process.env.PATH || ''}`,
+          PYTHONPATH: [bundledHermes, bundledSitePackages, process.env.PYTHONPATH]
+            .filter(Boolean).join(path.delimiter),
+          HERMES_HOME,
+          HERMES_BUNDLED: '1',
+          HERMES_RESOURCES: process.resourcesPath,
+          HERMES_GIT_BASH_PATH: path.join(process.resourcesPath, 'git', 'bin', 'bash.exe')
+        },
+        shell: false,
+        label: 'Bundled Python (embedded)',
+        root: bundledHermes,
+        bootstrap: false
+      }
+    }
+  }
+
+  // 4. Bootstrap-complete ACTIVE_HERMES_ROOT -- the canonical install at
   //    %LOCALAPPDATA%\hermes\hermes-agent (Windows) or ~/.hermes/hermes-agent.
   //    The bootstrap marker means install.ps1 stages finished and the user
   //    completed initial configuration; we trust the install and go straight
@@ -2026,7 +2068,43 @@ function resolveHermesBackend(dashboardArgs) {
   }
 }
 
+async function ensureBundledEnvironment() {
+  const dirs = ['cron', 'sessions', 'logs', 'pairing', 'hooks', 'image_cache', 'audio_cache', 'memories', 'skills']
+  for (const dir of dirs) {
+    fs.mkdirSync(path.join(HERMES_HOME, dir), { recursive: true })
+  }
+
+  const envPath = path.join(HERMES_HOME, '.env')
+  if (!fileExists(envPath)) {
+    const bundledEnv = path.join(process.resourcesPath, 'hermes', '.env.example')
+    const content = fileExists(bundledEnv)
+      ? fs.readFileSync(bundledEnv, 'utf8')
+      : '# Hermes Desktop -- bundled install\n# Add your API keys below\n'
+    fs.writeFileSync(envPath, content, 'utf8')
+    rememberLog(`[bundled] Created default .env at ${envPath}`)
+  }
+
+  const configPath = path.join(HERMES_HOME, 'config.yaml')
+  if (!fileExists(configPath)) {
+    const bundledConfig = path.join(process.resourcesPath, 'hermes', 'hermes_cli', 'config.py')
+    if (fileExists(bundledConfig)) {
+      rememberLog('[bundled] config.yaml will be created by Python backend on first start')
+    }
+  }
+
+  if (IS_WINDOWS) {
+    const bundledBash = path.join(process.resourcesPath, 'git', 'bin', 'bash.exe')
+    if (fileExists(bundledBash)) {
+      rememberLog(`[bundled] Git Bash available at ${bundledBash}`)
+    }
+  }
+}
+
 async function ensureRuntime(backend) {
+  if (backend.kind === 'bundled') {
+    await ensureBundledEnvironment()
+  }
+
   if (!backend.bootstrap) {
     await advanceBootProgress('runtime.external', `Using ${backend.label}`, 32)
     return backend
